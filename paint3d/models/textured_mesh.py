@@ -12,6 +12,9 @@ import torch.nn as nn
 from .mesh import Mesh
 from .render import Renderer
 
+from .ray_helper import RaycastingImaging
+from trimesh import Trimesh
+
 import sys
 sys.path.append("../")
 from paint3d.utils import inpaint_atlas, save_tensor_image
@@ -27,6 +30,7 @@ class TexturedMeshModel(nn.Module):
         self.cache_path = Path(self.cfg.log.cache_path) / Path(cfg.guide.shape_path).stem
         self.default_color = self.cfg.render.texture_default_color
         self.force_run_xatlas = self.cfg.guide.force_run_xatlas
+        self.max_hits = cfg.render.max_hits
 
         self.mesh = Mesh(self.cfg.guide.shape_path, self.device, target_scale=self.cfg.guide.shape_scale,
                          mesh_dy=self.cfg.render.look_at_height,
@@ -41,6 +45,7 @@ class TexturedMeshModel(nn.Module):
         self.face_attributes = kal.ops.mesh.index_vertices_by_faces(self.vt.unsqueeze(0), self.ft.long()).detach()
         # texture map list for texture fusion
         self.texture_list = []
+        self.generate_occluded_geometry()
 
     def init_paint(self):
         if self.initial_texture_path is not None:
@@ -98,6 +103,62 @@ class TexturedMeshModel(nn.Module):
                 torch.save(vt.cpu(), vt_cache)
                 torch.save(ft.cpu(), ft_cache)
         return vt, ft
+
+    def generate_occluded_geometry(self, faces, texture_init_maps, new_verts_uvs):
+        vertices = self.mesh.verts_packed().cpu().numpy()  # (V, 3) shape, move to CPU and convert to numpy
+        faces = self.mesh.faces_packed().cpu().numpy()  # (F, 3) shape, move to CPU and convert to numpy
+
+        raycast = RaycastingImaging()
+
+        self.visible_faces_list = []
+        self.visible_texture_map_list = []
+        self.mesh_face_indices_list = []
+        
+        for k, camera in enumerate(self.cameras):
+            R = camera.R.cpu().numpy()
+            T = camera.T.cpu().numpy()
+
+            Rt = np.eye(4)  # Start with an identity matrix
+            Rt[:3, :3] = np.swapaxes(R, 1, 2)  # Top-left 3x3 is the transposed rotation
+            Rt[:3, 3] = T   # Top-right 3x1 is the inverted translation
+
+            # mesh_frame = Trimesh(vertices=vertices, faces=self.mesh.faces_packed().cpu().numpy()).apply_transform(Rt)
+            
+            # self.mesh # Meshes -> Trimesh
+            mesh_frame = Trimesh(vertices=self.mesh.verts_packed().cpu().numpy(), faces=self.mesh.faces_packed().cpu().numpy()).apply_transform(Rt)
+            
+            c2w = np.eye(4).astype(np.float32)[:3]
+            raycast.prepare(image_height=512 * 3, image_width=512 * 3, c2w=c2w)
+            ray_indexes, points, mesh_face_indices = raycast.get_image(mesh_frame, self.max_hits * 2 - 1)
+            
+            for i in range(self.max_hits):
+                idx = i
+                # idx = i * 2 if self.remove_backface_hits else i
+                # print(f'Length of mesh faces indices {idx}', len(mesh_face_indices[idx]))
+                # print(f"Mesh faces indices of {idx}", mesh_face_indices[idx])
+                visible_faces = faces.verts_idx[mesh_face_indices[idx]]  # Only keep the visible faces
+                self.mesh_face_indices_list.append(torch.tensor(mesh_face_indices[idx], dtype=torch.int64, device='cuda'))
+                visible_faces = torch.tensor(visible_faces, dtype=torch.int64, device='cuda')
+                
+                # Initialize new mesh with Trimesh
+                # Call init_mesh with the new mesh
+                # Save the mesh info in a list
+
+                self.visible_faces_list.append(visible_faces)
+                
+                # self.visible_texture_map_list.append(self.mesh.textures.faces_uvs_padded()[0, mesh_face_indices[idx]])
+                self.visible_texture_map_list.append(faces.textures_idx[mesh_face_indices[idx]])
+        
+        new_map = torch.zeros(self.target_size+(self.channels,), device=self.device)
+        expanded_texture_init_maps = texture_init_maps.repeat(len(self.cameras) * self.max_hits, 1, 1, 1)
+        textures = TexturesUV(
+            expanded_texture_init_maps, 
+            self.visible_texture_map_list, 
+            [new_verts_uvs] * len(self.cameras) * self.max_hits, # [self.mesh.textures.verts_uvs_padded()[0]] * len(self.cameras) * self.max_hits, 
+            sampling_mode=self.sampling_mode
+        )
+        self.occ_mesh = Meshes(verts = [self.mesh.verts_packed()] * len(self.cameras) * self.max_hits, faces = self.visible_faces_list, textures = textures)
+        self.occ_cameras = FoVOrthographicCameras(device=self.device, R=self.cameras.R.repeat_interleave(self.max_hits, 0), T=self.cameras.T.repeat_interleave(self.max_hits, 0), scale_xyz=self.cameras.scale_xyz.repeat_interleave(self.max_hits, 0))
 
     def forward(self, x):
         raise NotImplementedError

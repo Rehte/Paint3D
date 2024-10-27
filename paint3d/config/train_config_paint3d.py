@@ -31,6 +31,8 @@ class RenderConfig:
     # Suzanne
     views_init: List[float] = field(default_factory=[0, 23].copy)
     views_inpaint: List[Tuple[float, float]] = field(default_factory=[(5, 6), (24, 25)].copy)
+    # XRay
+    max_hits: int = 2
 
 
 @dataclass
