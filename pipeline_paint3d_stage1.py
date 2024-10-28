@@ -81,6 +81,7 @@ def gen_init_view(sd_cfg, cnet, mesh_model, dataloaders, outdir, view_ids=[]):
     for view_id in view_ids:
         data = view_angle_info[view_id]
         theta, phi, radius = data['theta'], data['phi'], data['radius']
+        mesh_model.generate_occluded_geometry(view_id, (theta, phi, radius))
         outputs = mesh_model.render(theta=theta, phi=phi, radius=radius)
         depth_render = outputs['depth']
         init_depth_map.append(depth_render)
